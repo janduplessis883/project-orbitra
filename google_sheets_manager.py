@@ -11,6 +11,7 @@ SHEET_NAME_SHIFTS = "Sheet2"
 SHEET_NAME_ASSIGNMENTS = "Sheet3"
 SHEET_NAME_ANNUAL_LEAVE = "Sheet4"
 SHEET_NAME_SPECIALTIES = "Sheet5"
+SHEET_NAME_GENERATED_SCHEDULES = "Sheet3" # Adding Sheet3 for generated schedules
 
 # Authenticate with Google Sheets using st.secrets
 def get_gspread_client():
@@ -37,7 +38,8 @@ def get_worksheet(sheet_name_key):
         "Shifts": SHEET_NAME_SHIFTS,
         "Assignments": SHEET_NAME_ASSIGNMENTS,
         "Annual_Leave": SHEET_NAME_ANNUAL_LEAVE,
-        "Specialties": SHEET_NAME_SPECIALTIES
+        "Specialties": SHEET_NAME_SPECIALTIES,
+        "Generated_Schedules": SHEET_NAME_GENERATED_SCHEDULES # Map new logical name
     }
     actual_sheet_name = sheet_name_map.get(sheet_name_key)
 
@@ -81,7 +83,7 @@ def update_row(sheet_name, row_id, data):
         # Get all data from the sheet to find the row index
         all_data = worksheet.get_all_records()
         df = pd.DataFrame(all_data)
-        
+
         # Find the index of the row to update
         if 'user_id' in df.columns:
             row_index = df[df['user_id'] == row_id].index
@@ -94,8 +96,8 @@ def update_row(sheet_name, row_id, data):
 
         if not row_index.empty:
             # gspread rows are 1-based, and there's a header row
-            sheet_row_index = row_index[0] + 2 
-            
+            sheet_row_index = row_index[0] + 2
+
             # Prepare the values in the correct order
             header = worksheet.row_values(1)
             update_values = [data.get(h) for h in header]
@@ -105,7 +107,7 @@ def update_row(sheet_name, row_id, data):
             for i, value in enumerate(update_values):
                 if value is not None: # Only update cells with new values
                     cells_to_update.append(gspread.cell.Cell(sheet_row_index, i + 1, value))
-            
+
             if cells_to_update:
                 worksheet.update_cells(cells_to_update)
             return True
@@ -117,6 +119,38 @@ def append_row(sheet_name, row_data):
     if worksheet:
         worksheet.append_row(row_data)
         return True
+    return False
+
+def delete_row(sheet_name, row_id):
+    """Deletes a single row from the specified worksheet identified by its ID."""
+    worksheet = get_worksheet(sheet_name)
+    if worksheet:
+        all_data = worksheet.get_all_records()
+        df = pd.DataFrame(all_data)
+
+        id_column = None
+        if 'user_id' in df.columns:
+            id_column = 'user_id'
+        elif 'shift_id' in df.columns:
+            id_column = 'shift_id'
+        elif 'assignment_id' in df.columns:
+            id_column = 'assignment_id'
+        elif 'leave_id' in df.columns: # Added for annual leave
+            id_column = 'leave_id'
+        else:
+            st.error(f"No identifiable ID column found for sheet '{sheet_name}'.")
+            return False
+
+        if id_column:
+            row_index = df[df[id_column] == row_id].index
+            if not row_index.empty:
+                # gspread rows are 1-based, and there's a header row
+                sheet_row_index = int(row_index[0]) + 2
+                worksheet.delete_rows(sheet_row_index)
+                return True
+            else:
+                st.warning(f"Row with ID '{row_id}' not found in sheet '{sheet_name}'.")
+                return False
     return False
 
 def clear_cache():
@@ -137,13 +171,42 @@ def update_users_df(df):
 
 @st.cache_data
 def get_shifts_df():
-    """Reads the Shifts sheet and returns a DataFrame."""
-    return read_data("Shifts")
+    """
+    Reads the Shifts sheet and returns a DataFrame.
+    Constructs 'shift_name' from 'base_shift_name' and 'session_type'.
+    """
+    df = read_data("Shifts")
+    if not df.empty:
+        # Ensure 'base_shift_name' and 'session_type' columns exist
+        # Assuming 'shift_name' column in Google Sheet is now 'base_shift_name'
+        if 'shift_name' in df.columns:
+            df.rename(columns={'shift_name': 'base_shift_name'}, inplace=True)
+        if 'base_shift_name' not in df.columns:
+            df['base_shift_name'] = '' # Default empty string
+
+        if 'session_type' not in df.columns:
+            df['session_type'] = 'AM' # Default to AM
+
+        # Construct the combined 'shift_name' for internal use
+        # Format: base-name-am/pm
+        df['shift_name'] = df.apply(
+            lambda row: f"{row['base_shift_name'].lower().replace(' ', '-')}-{row['session_type'].lower()}"
+            if row['session_type'] in ['AM', 'PM'] else row['base_shift_name'].lower().replace(' ', '-'),
+            axis=1
+        )
+    return df
 
 def update_shifts_df(df):
-    """Writes the Shifts DataFrame back to the Shifts sheet."""
+    """
+    Writes the Shifts DataFrame back to the Shifts sheet.
+    Assumes df contains 'base_shift_name' and 'session_type'.
+    """
     for _, row in df.iterrows():
-        update_row("Shifts", row['shift_id'], row.to_dict())
+        # Prepare data for update_row, ensuring base_shift_name and session_type are present
+        data_to_update = row.to_dict()
+        # Remove the constructed 'shift_name' if it exists, as it's not a sheet column
+        data_to_update.pop('shift_name', None)
+        update_row("Shifts", row['shift_id'], data_to_update)
     return True
 
 @st.cache_data
