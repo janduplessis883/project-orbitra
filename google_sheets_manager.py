@@ -11,6 +11,7 @@ SHEET_NAME_SHIFTS = "Sheet2"
 SHEET_NAME_ASSIGNMENTS = "Sheet3"
 SHEET_NAME_ANNUAL_LEAVE = "Sheet4"
 SHEET_NAME_SPECIALTIES = "Sheet5"
+SHEET_NAME_GENERATED_SCHEDULES = "Sheet3" # Adding Sheet3 for generated schedules
 
 # Authenticate with Google Sheets using st.secrets
 def get_gspread_client():
@@ -37,7 +38,8 @@ def get_worksheet(sheet_name_key):
         "Shifts": SHEET_NAME_SHIFTS,
         "Assignments": SHEET_NAME_ASSIGNMENTS,
         "Annual_Leave": SHEET_NAME_ANNUAL_LEAVE,
-        "Specialties": SHEET_NAME_SPECIALTIES
+        "Specialties": SHEET_NAME_SPECIALTIES,
+        "Generated_Schedules": SHEET_NAME_GENERATED_SCHEDULES # Map new logical name
     }
     actual_sheet_name = sheet_name_map.get(sheet_name_key)
 
@@ -81,7 +83,7 @@ def update_row(sheet_name, row_id, data):
         # Get all data from the sheet to find the row index
         all_data = worksheet.get_all_records()
         df = pd.DataFrame(all_data)
-        
+
         # Find the index of the row to update
         if 'user_id' in df.columns:
             row_index = df[df['user_id'] == row_id].index
@@ -94,8 +96,8 @@ def update_row(sheet_name, row_id, data):
 
         if not row_index.empty:
             # gspread rows are 1-based, and there's a header row
-            sheet_row_index = row_index[0] + 2 
-            
+            sheet_row_index = row_index[0] + 2
+
             # Prepare the values in the correct order
             header = worksheet.row_values(1)
             update_values = [data.get(h) for h in header]
@@ -105,7 +107,7 @@ def update_row(sheet_name, row_id, data):
             for i, value in enumerate(update_values):
                 if value is not None: # Only update cells with new values
                     cells_to_update.append(gspread.cell.Cell(sheet_row_index, i + 1, value))
-            
+
             if cells_to_update:
                 worksheet.update_cells(cells_to_update)
             return True

@@ -235,7 +235,8 @@ def main():
         with st.form("add_shift_form", clear_on_submit=True):
             col1, col2 = st.columns(2)
             with col1:
-                shift_name = st.text_input("Shift Name", key="new_shift_name")
+                base_shift_name = st.text_input("Shift Name", key="new_shift_name_base")
+                am_pm_selection = st.selectbox("AM/PM", ["AM", "PM"], key="new_shift_am_pm")
                 start_time = st.time_input("Start Time", value=pd.to_datetime("08:00").time(), key="new_shift_start_time")
                 end_time = st.time_input("End Time", value=pd.to_datetime("12:10").time(), key="new_shift_end_time")
             with col2:
@@ -248,10 +249,12 @@ def main():
 
             submitted = st.form_submit_button("Add Shift")
             if submitted:
-                if shift_name and start_time and end_time and required_role:
+                if base_shift_name and start_time and end_time and required_role:
+                    # Construct the shift_name in the specified format
+                    formatted_shift_name = f"{base_shift_name.lower().replace(' ', '-')}-{am_pm_selection.lower()}"
                     new_shift_data = {
                         "shift_id": generate_uuid(),
-                        "shift_name": shift_name,
+                        "shift_name": formatted_shift_name,
                         "start_time": str(start_time),
                         "end_time": str(end_time),
                         "required_role": required_role,
@@ -275,7 +278,7 @@ def main():
                     append_row("Shifts", new_shift_df.values.tolist()[0])
 
                     clear_cache()
-                    st.success(f"Shift '{shift_name}' added successfully!")
+                    st.success(f"Shift '{formatted_shift_name}' added successfully!")
                     st.rerun()
                 else:
                     st.error("Please fill in all required fields (Shift Name, Start Time, End Time, Required Role).")
@@ -325,13 +328,29 @@ def main():
 
         st.subheader("Edit Shift")
         if not st.session_state.shifts_df.empty:
-            shift_to_edit_name = st.selectbox("Select Shift to Edit", st.session_state.shifts_df['shift_name'].tolist())
-            if shift_to_edit_name:
-                shift_to_edit = st.session_state.shifts_df[st.session_state.shifts_df['shift_name'] == shift_to_edit_name].iloc[0].to_dict()
+            shift_to_edit_name_display = st.selectbox("Select Shift to Edit", st.session_state.shifts_df['shift_name'].tolist())
+            if shift_to_edit_name_display:
+                shift_to_edit = st.session_state.shifts_df[st.session_state.shifts_df['shift_name'] == shift_to_edit_name_display].iloc[0].to_dict()
+
+                # Parse existing shift_name into base_shift_name and am/pm
+                full_shift_name = shift_to_edit.get('shift_name') # Get the value, could be None
+
+                initial_base_shift_name = ""
+                initial_am_pm_selection = "AM" # Default
+
+                if full_shift_name: # Check if it's not None or empty
+                    current_shift_name_parts = full_shift_name.rsplit('-', 1)
+                    if len(current_shift_name_parts) == 2:
+                        initial_base_shift_name = current_shift_name_parts[0].replace('-', ' ')
+                        initial_am_pm_selection = current_shift_name_parts[1].upper()
+                    else:
+                        initial_base_shift_name = full_shift_name
+
                 with st.form("edit_shift_form", clear_on_submit=True):
                     col1, col2 = st.columns(2)
                     with col1:
-                        shift_name = st.text_input("Shift Name", value=shift_to_edit['shift_name'], key="edit_shift_name")
+                        base_shift_name = st.text_input("Shift Name", value=initial_base_shift_name, key="edit_shift_name_base")
+                        am_pm_selection = st.selectbox("AM/PM", ["AM", "PM"], index=["AM", "PM"].index(initial_am_pm_selection), key="edit_shift_am_pm")
                         start_time = st.time_input("Start Time", value=pd.to_datetime(shift_to_edit['start_time']).time(), key="edit_shift_start_time")
                         end_time = st.time_input("End Time", value=pd.to_datetime(shift_to_edit['end_time']).time(), key="edit_shift_end_time")
                     with col2:
@@ -350,9 +369,11 @@ def main():
 
                     submitted = st.form_submit_button("Update Shift")
                     if submitted:
+                        # Construct the shift_name in the specified format
+                        formatted_shift_name = f"{base_shift_name.lower().replace(' ', '-')}-{am_pm_selection.lower()}"
                         updated_shift_data = {
                             "shift_id": shift_to_edit['shift_id'],
-                            "shift_name": shift_name,
+                            "shift_name": formatted_shift_name,
                             "start_time": str(start_time),
                             "end_time": str(end_time),
                             "required_role": required_role,
@@ -364,7 +385,7 @@ def main():
                         }
                         update_row("Shifts", shift_to_edit['shift_id'], updated_shift_data)
                         clear_cache()
-                        st.success(f"Shift '{shift_name}' updated successfully!")
+                        st.success(f"Shift '{formatted_shift_name}' updated successfully!")
                         st.rerun()
         else:
             st.info("No shifts to edit.")
@@ -411,7 +432,7 @@ def main():
                         # Plot staffing levels over time
                         st.subheader("Staffing Levels Over Time")
                         staffing_counts = display_df.groupby('date').size().reset_index(name='staff_count')
-                        
+
                         import plotly.express as px
                         fig = px.line(staffing_counts, x='date', y='staff_count', title='Total Staff Assigned Per Day')
                         st.plotly_chart(fig, use_container_width=True)
