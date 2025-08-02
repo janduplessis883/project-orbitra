@@ -2,7 +2,7 @@ from ortools.sat.python import cp_model
 import pandas as pd
 import uuid
 
-def solve_shift_scheduling(users_df, shifts_df, start_date, num_days=7):
+def solve_shift_scheduling(users_df, shifts_df, start_date, num_days=7, daily_staffing_req=None):
     """
     Solves the shift scheduling problem using CP-SAT.
 
@@ -24,11 +24,12 @@ def solve_shift_scheduling(users_df, shifts_df, start_date, num_days=7):
     staff_sessions_per_day_limit = users_df.set_index('user_id')['sessions_per_day_limit'].to_dict()
     staff_preferred_day_off = users_df.set_index('user_id')['preferred_day_off'].to_dict()
 
-    shift_names = shifts_df['shift_name'].tolist()
     shift_ids = shifts_df['shift_id'].tolist()
     shift_required_roles = shifts_df.set_index('shift_id')['required_role'].to_dict()
     shift_capacities = shifts_df.set_index('shift_id')['capacity'].to_dict()
     shift_required_days = shifts_df.set_index('shift_id')['required_days'].to_dict()
+    shift_base_names = shifts_df.set_index('shift_id')['base_shift_name'].to_dict()
+    shift_session_types = shifts_df.set_index('shift_id')['session_type'].to_dict()
 
     # Create a list of dates for the scheduling period
     dates = [start_date + pd.Timedelta(days=i) for i in range(num_days)]
@@ -90,6 +91,41 @@ def solve_shift_scheduling(users_df, shifts_df, start_date, num_days=7):
                     # If it's their preferred day off, they cannot be assigned
                     model.Add(sum(assigned[(s_id, date, sh_id)] for sh_id in shift_ids) == 0)
 
+    # 7. Daily staffing requirements
+    if daily_staffing_req:
+        for i, date in enumerate(dates):
+            day_of_week = days_of_week[i]
+            for role, requirements in daily_staffing_req.items():
+                min_staff = requirements.get(day_of_week, 0)
+                if min_staff > 0:
+                    staff_in_role = [s_id for s_id, r in staff_roles.items() if r == role]
+                    if staff_in_role:
+                        model.Add(sum(assigned[(s_id, date, sh_id)] for s_id in staff_in_role for sh_id in shift_ids) >= min_staff)
+
+    # 7. Soft Constraint: Prefer AM/PM shifts of the same base_shift_name for users working 2 sessions
+    violations = []
+    # Group shifts by base_shift_name to find potential AM/PM pairs
+    shifts_by_base_name = shifts_df.groupby('base_shift_name')['shift_id'].apply(list).to_dict()
+
+    for s_id in staff_ids:
+        # Apply this rule only to users who can work 2 sessions a day
+        if staff_sessions_per_day_limit.get(s_id, 1) >= 2:
+            for date in dates:
+                # Find all pairs of shifts with different base names
+                for i, sh_id1 in enumerate(shift_ids):
+                    for j, sh_id2 in enumerate(shift_ids):
+                        if i < j and shift_base_names[sh_id1] != shift_base_names[sh_id2]:
+                            # This variable is true if the user is assigned to this specific pair of shifts
+                            are_both_assigned = model.NewBoolVar(f'are_both_assigned_{s_id}_{date.strftime("%Y%m%d")}_{sh_id1}_{sh_id2}')
+                            model.AddBoolAnd([assigned[(s_id, date, sh_id1)], assigned[(s_id, date, sh_id2)]]).OnlyEnforceIf(are_both_assigned)
+                            model.Add(sum([assigned[(s_id, date, sh_id1)], assigned[(s_id, date, sh_id2)]]) < 2).OnlyEnforceIf(are_both_assigned.Not())
+
+                            # This is a violation
+                            violations.append(are_both_assigned)
+
+    # Minimize the total number of violations
+    model.Minimize(sum(violations))
+
     # --- Solve Model ---
     solver = cp_model.CpSolver()
     status = solver.Solve(model)
@@ -109,9 +145,16 @@ def solve_shift_scheduling(users_df, shifts_df, start_date, num_days=7):
                             "type": "Work", # Assuming all are work for now
                             "status": "Scheduled"
                         })
-        return pd.DataFrame(assigned_shifts_list)
+        return pd.DataFrame(assigned_shifts_list), status, "Feasible solution found."
     else:
-        return None
+        # Provide a reason for infeasibility
+        if status == cp_model.INFEASIBLE:
+            # You can add more sophisticated analysis here to pinpoint the exact conflict.
+            # For now, we provide a general message and check for common issues.
+            # For example, check if total capacity required exceeds total staff available for any role.
+            return None, status, "No feasible solution found. Check for conflicting constraints, such as staff availability vs. shift requirements, or too many preferred days off."
+        else:
+            return None, status, "Solver stopped for other reasons (e.g., time limit)."
 
 # Example usage (for testing purposes)
 if __name__ == "__main__":

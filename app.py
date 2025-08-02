@@ -1,6 +1,7 @@
 import streamlit as st
-from google_sheets_manager import get_users_df, get_shifts_df, get_assignments_df, generate_uuid, update_users_df, update_shifts_df, update_assignments_df, get_gspread_client, append_row, update_row, clear_cache, get_annual_leave_df, get_specialties_df, get_worksheet
+from google_sheets_manager import get_users_df, get_shifts_df, get_assignments_df, generate_uuid, update_users_df, update_shifts_df, update_assignments_df, get_gspread_client, append_row, update_row, clear_cache, get_annual_leave_df, get_specialties_df, get_worksheet, delete_row
 import pandas as pd
+from ortools.sat.python import cp_model
 
 def main():
     st.set_page_config(layout="wide")
@@ -18,6 +19,8 @@ def main():
         st.session_state.annual_leave_df = pd.DataFrame()
     if 'specialties_df' not in st.session_state:
         st.session_state.specialties_df = pd.DataFrame()
+    if 'daily_staffing_req' not in st.session_state:
+        st.session_state.daily_staffing_req = {}
 
     # Initialize Google Sheets client
     @st.cache_resource
@@ -221,13 +224,32 @@ def main():
         else:
             st.info("No users to edit.")
 
+        st.subheader("Delete User")
+        if not st.session_state.users_df.empty:
+            user_to_delete_name = st.selectbox("Select User to Delete", st.session_state.users_df['name'].tolist(), key="delete_user_select")
+            if user_to_delete_name:
+                st.warning(f"You are about to delete {user_to_delete_name}. This action cannot be undone.")
+                user_to_delete_id = st.session_state.users_df[st.session_state.users_df['name'] == user_to_delete_name]['user_id'].iloc[0]
+                if st.button("Confirm Delete User", key="delete_user_confirm_button"):
+                    delete_row("Users", user_to_delete_id)
+                    clear_cache()
+                    st.success(f"User '{user_to_delete_name}' deleted successfully!")
+                    st.rerun()
+        else:
+            st.info("No users to delete.")
+
     elif page == "Shift Definition":
         st.header("Shift Definition")
         st.write("Define and manage different shift types.")
 
         st.subheader("Current Shifts")
         if not st.session_state.shifts_df.empty:
-            st.dataframe(st.session_state.shifts_df)
+            # Display base_shift_name and session_type directly
+            display_shifts_df = st.session_state.shifts_df.copy()
+            # Remove the constructed 'shift_name' column for display if it exists
+            if 'shift_name' in display_shifts_df.columns:
+                display_shifts_df.drop(columns=['shift_name'], inplace=True)
+            st.dataframe(display_shifts_df)
         else:
             st.info("No shifts defined yet. Please add new shifts.")
 
@@ -235,8 +257,8 @@ def main():
         with st.form("add_shift_form", clear_on_submit=True):
             col1, col2 = st.columns(2)
             with col1:
-                base_shift_name = st.text_input("Shift Name", key="new_shift_name_base")
-                am_pm_selection = st.selectbox("AM/PM", ["AM", "PM"], key="new_shift_am_pm")
+                base_shift_name = st.text_input("Base Shift Name", key="new_shift_name_base")
+                session_type = st.selectbox("Session Type", ["AM", "PM", "None"], key="new_shift_session_type")
                 start_time = st.time_input("Start Time", value=pd.to_datetime("08:00").time(), key="new_shift_start_time")
                 end_time = st.time_input("End Time", value=pd.to_datetime("12:10").time(), key="new_shift_end_time")
             with col2:
@@ -250,11 +272,18 @@ def main():
             submitted = st.form_submit_button("Add Shift")
             if submitted:
                 if base_shift_name and start_time and end_time and required_role:
-                    # Construct the shift_name in the specified format
-                    formatted_shift_name = f"{base_shift_name.lower().replace(' ', '-')}-{am_pm_selection.lower()}"
+                    # Format base_shift_name for storage (lowercase, hyphens)
+                    formatted_base_shift_name = str(base_shift_name).lower().replace(' ', '-')
+                    session_type_str = str(session_type)
+
+                    # Construct the full shift_name for the 'shift_name' column in Google Sheet
+                    # This will be used for display purposes in some parts of the app
+                    formatted_shift_name = f"{formatted_base_shift_name}-{session_type_str.lower()}" if session_type_str in ["AM", "PM"] else formatted_base_shift_name
                     new_shift_data = {
                         "shift_id": generate_uuid(),
-                        "shift_name": formatted_shift_name,
+                        "shift_name": formatted_shift_name, # Combined name for display
+                        "base_shift_name": formatted_base_shift_name, # New column for base name
+                        "session_type": session_type_str, # New column for AM/PM
                         "start_time": str(start_time),
                         "end_time": str(end_time),
                         "required_role": required_role,
@@ -328,29 +357,33 @@ def main():
 
         st.subheader("Edit Shift")
         if not st.session_state.shifts_df.empty:
-            shift_to_edit_name_display = st.selectbox("Select Shift to Edit", st.session_state.shifts_df['shift_name'].tolist())
-            if shift_to_edit_name_display:
-                shift_to_edit = st.session_state.shifts_df[st.session_state.shifts_df['shift_name'] == shift_to_edit_name_display].iloc[0].to_dict()
+            # Use base_shift_name for selection display
+            # Ensure 'base_shift_name' column exists before trying to access it
+            if 'base_shift_name' not in st.session_state.shifts_df.columns:
+                st.error("The 'base_shift_name' column is missing from your Shifts data. Please ensure your Google Sheet is configured correctly.")
+                return
 
-                # Parse existing shift_name into base_shift_name and am/pm
-                full_shift_name = shift_to_edit.get('shift_name') # Get the value, could be None
+            shift_to_edit_base_name_display = st.selectbox("Select Shift to Edit", st.session_state.shifts_df['base_shift_name'].tolist())
+            if shift_to_edit_base_name_display:
+                # Find the shift using base_shift_name
+                shift_to_edit = st.session_state.shifts_df[st.session_state.shifts_df['base_shift_name'] == shift_to_edit_base_name_display].iloc[0].to_dict()
 
-                initial_base_shift_name = ""
-                initial_am_pm_selection = "AM" # Default
+                # Read base_shift_name and session_type directly from the loaded shift
+                initial_base_shift_name = shift_to_edit.get('base_shift_name', '')
+                initial_session_type = shift_to_edit.get('session_type', 'None')
 
-                if full_shift_name: # Check if it's not None or empty
-                    current_shift_name_parts = full_shift_name.rsplit('-', 1)
-                    if len(current_shift_name_parts) == 2:
-                        initial_base_shift_name = current_shift_name_parts[0].replace('-', ' ')
-                        initial_am_pm_selection = current_shift_name_parts[1].upper()
-                    else:
-                        initial_base_shift_name = full_shift_name
+                # Determine the index for the session_type selectbox
+                session_type_options = ["AM", "PM", "None"]
+                try:
+                    selected_session_type_index = session_type_options.index(initial_session_type)
+                except ValueError:
+                    selected_session_type_index = session_type_options.index("None") # Default to None if not found
 
                 with st.form("edit_shift_form", clear_on_submit=True):
                     col1, col2 = st.columns(2)
                     with col1:
-                        base_shift_name = st.text_input("Shift Name", value=initial_base_shift_name, key="edit_shift_name_base")
-                        am_pm_selection = st.selectbox("AM/PM", ["AM", "PM"], index=["AM", "PM"].index(initial_am_pm_selection), key="edit_shift_am_pm")
+                        base_shift_name = st.text_input("Base Shift Name", value=initial_base_shift_name, key="edit_shift_name_base")
+                        session_type = st.selectbox("Session Type", session_type_options, index=selected_session_type_index, key="edit_shift_session_type")
                         start_time = st.time_input("Start Time", value=pd.to_datetime(shift_to_edit['start_time']).time(), key="edit_shift_start_time")
                         end_time = st.time_input("End Time", value=pd.to_datetime(shift_to_edit['end_time']).time(), key="edit_shift_end_time")
                     with col2:
@@ -369,11 +402,17 @@ def main():
 
                     submitted = st.form_submit_button("Update Shift")
                     if submitted:
-                        # Construct the shift_name in the specified format
-                        formatted_shift_name = f"{base_shift_name.lower().replace(' ', '-')}-{am_pm_selection.lower()}"
+                        # Format base_shift_name for storage (lowercase, hyphens)
+                        formatted_base_shift_name = str(base_shift_name).lower().replace(' ', '-')
+                        session_type_str = str(session_type)
+
+                        # Construct the full shift_name for the 'shift_name' column in Google Sheet
+                        formatted_shift_name = f"{formatted_base_shift_name}-{session_type_str.lower()}" if session_type_str in ["AM", "PM"] else formatted_base_shift_name
                         updated_shift_data = {
                             "shift_id": shift_to_edit['shift_id'],
-                            "shift_name": formatted_shift_name,
+                            "shift_name": formatted_shift_name, # Combined name for display
+                            "base_shift_name": formatted_base_shift_name, # New column for base name
+                            "session_type": session_type_str, # New column for AM/PM
                             "start_time": str(start_time),
                             "end_time": str(end_time),
                             "required_role": required_role,
@@ -389,6 +428,19 @@ def main():
                         st.rerun()
         else:
             st.info("No shifts to edit.")
+
+        st.subheader("Delete Shift")
+        if not st.session_state.shifts_df.empty:
+            shift_to_delete_base_name_display = st.selectbox("Select Shift to Delete", st.session_state.shifts_df['base_shift_name'].tolist(), key="delete_shift_name")
+            if shift_to_delete_base_name_display:
+                shift_to_delete_id = st.session_state.shifts_df[st.session_state.shifts_df['base_shift_name'] == shift_to_delete_base_name_display]['shift_id'].iloc[0]
+                if st.button("Delete Shift", key="delete_shift_button"):
+                    delete_row("Shifts", shift_to_delete_id)
+                    clear_cache()
+                    st.success(f"Shift '{shift_to_delete_base_name_display}' deleted successfully!")
+                    st.rerun()
+        else:
+            st.info("No shifts to delete.")
 
     elif page == "Shift Scheduling":
         st.header("Shift Scheduling")
@@ -407,27 +459,29 @@ def main():
             else:
                 with st.spinner("Generating schedule... This may take a moment."):
                     from shift_solver import solve_shift_scheduling
-                    assigned_df = solve_shift_scheduling(
+                    assigned_df, status, reason = solve_shift_scheduling(
                         st.session_state.users_df,
                         st.session_state.shifts_df,
                         schedule_start_date,
-                        num_days_to_schedule
+                        num_days_to_schedule,
+                        st.session_state.daily_staffing_req
                     )
 
+                    # Display results or reason for failure
                     if assigned_df is not None and not assigned_df.empty:
                         st.success("Schedule generated successfully!")
                         st.subheader("Generated Schedule Overview")
 
                         # Merge with user and shift names for better readability
                         display_df = assigned_df.merge(st.session_state.users_df[['user_id', 'name', 'role']], on='user_id', how='left')
-                        display_df = display_df.merge(st.session_state.shifts_df[['shift_id', 'shift_name', 'start_time', 'end_time']], on='shift_id', how='left')
+                        display_df = display_df.merge(st.session_state.shifts_df[['shift_id', 'base_shift_name', 'session_type', 'start_time', 'end_time']], on='shift_id', how='left')
 
                         # Sort for better display
                         display_df['date'] = pd.to_datetime(display_df['date'])
                         display_df['Day of the Week'] = display_df['date'].dt.day_name()
-                        display_df = display_df.sort_values(by=['date', 'role', 'start_time', 'shift_name'])
+                        display_df = display_df.sort_values(by=['date', 'role', 'start_time', 'base_shift_name'])
 
-                        st.dataframe(display_df[['date', 'Day of the Week', 'shift_name', 'start_time', 'end_time', 'name', 'role', 'type']])
+                        st.dataframe(display_df[['date', 'Day of the Week', 'base_shift_name', 'session_type', 'start_time', 'end_time', 'name', 'role', 'type']])
 
                         # Plot staffing levels over time
                         st.subheader("Staffing Levels Over Time")
@@ -439,9 +493,19 @@ def main():
 
                         st.subheader("Staffing Levels by Role Over Time")
                         staffing_by_role = display_df.groupby(['date', 'role']).size().reset_index(name='staff_count')
-                        fig_role = px.bar(staffing_by_role, x='date', y='staff_count', color='role',
-                                        title='Staff Assigned Per Role Per Day', barmode='stack')
+                        fig_role = px.bar(staffing_by_role, x='date', y='staff_count', color='role', title='Staff Assigned Per Role Per Day', barmode='stack')
                         st.plotly_chart(fig_role, use_container_width=True)
+
+                        st.subheader("User Schedule Summary")
+                        if not display_df.empty:
+                            assigned_users = display_df['name'].unique()
+                            for user_name in assigned_users:
+                                st.markdown(f"**{user_name}**")
+                                user_shifts = display_df[display_df['name'] == user_name]
+                                for _, shift_row in user_shifts.iterrows():
+                                    st.write(f"- {shift_row['Day of the Week']}, {shift_row['date'].strftime('%Y-%m-%d')}: {shift_row['base_shift_name']} ({shift_row['session_type']})")
+                        else:
+                            st.info("No users were assigned to any shifts.")
 
                         # Optionally, save to Google Sheet
                         if st.button("Save Generated Schedule to Google Sheet"):
@@ -449,20 +513,25 @@ def main():
                                 append_row("Assignments", row.tolist())
                             clear_cache()
                             st.success("Schedule saved to Assignments sheet!")
-                            st.rerun() # Rerun to ensure data is reloaded
+                            st.rerun()
 
+                    elif status == cp_model.FEASIBLE or status == cp_model.OPTIMAL:
+                        st.warning("Feasible solution found, but no shifts were assigned. This could be due to:")
+                        st.markdown("- **Shift Requirements:** No shifts are defined for the selected date range (check 'Required Days of the Week' in Shift Definition).")
+                        st.markdown("- **Staff Availability:** No staff members are available or meet the criteria for any defined shifts.")
                     else:
-                        st.warning("No feasible solution found for the given constraints and data. Try adjusting constraints or staff/shift availability.")
+                        st.error(f"Schedule generation failed: {reason}")
 
         st.subheader("Current Assignments (from Google Sheet)")
         if not st.session_state.assignments_df.empty:
             # Merge with user and shift names for better readability
             display_assignments_df = st.session_state.assignments_df.merge(st.session_state.users_df[['user_id', 'name', 'role']], on='user_id', how='left')
-            display_assignments_df = display_assignments_df.merge(st.session_state.shifts_df[['shift_id', 'shift_name', 'start_time', 'end_time']], on='shift_id', how='left')
+            # Merge with base_shift_name and session_type for display
+            display_assignments_df = display_assignments_df.merge(st.session_state.shifts_df[['shift_id', 'base_shift_name', 'session_type', 'start_time', 'end_time']], on='shift_id', how='left')
             display_assignments_df['date'] = pd.to_datetime(display_assignments_df['date'])
             display_assignments_df['Day of the Week'] = display_assignments_df['date'].dt.day_name()
-            display_assignments_df = display_assignments_df.sort_values(by=['date', 'role', 'start_time', 'shift_name'])
-            st.dataframe(display_assignments_df[['date', 'Day of the Week', 'shift_name', 'start_time', 'end_time', 'name', 'role', 'type', 'status']])
+            display_assignments_df = display_assignments_df.sort_values(by=['date', 'role', 'start_time', 'base_shift_name'])
+            st.dataframe(display_assignments_df[['date', 'Day of the Week', 'base_shift_name', 'session_type', 'start_time', 'end_time', 'name', 'role', 'type', 'status']])
         else:
             st.info("No assignments found in the Google Sheet.")
 
@@ -517,7 +586,7 @@ def main():
         st.info("These constraints are defined in the User Management and Shift Definition sections.")
         st.write("User-specific limits (sessions/day, days/week, preferred day off):")
         if not st.session_state.users_df.empty:
-            st.dataframe(st.session_state.users_df[['name', 'sessions_per_day_limit', 'days_per_week_limit', 'preferred_day_off']])
+            st.dataframe(st.session_state.users_df[['name', 'sessions_per_day_limit', 'preferred_day_off']])
         else:
             st.info("No users defined to display constraints.")
 
@@ -531,6 +600,31 @@ def main():
         st.info("This section will allow you to build custom constraints using a user-friendly interface.")
         # Placeholder for dynamic constraint builder UI
         st.write("Coming Soon: UI to define constraints like 'Staff A cannot work with Staff B', 'Staff C must work on Tuesdays', etc.")
+
+        st.subheader("Daily Staffing Requirements")
+        st.write("Define the minimum number of staff required for each role on each day of the week.")
+
+        roles = ["GP Partner", "Salaried GP", "Nurse", "HCA", "Receptionist", "Practice Manager", "Administrator", "Clinical Pharmacist", "Any"]
+        days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+        # Initialize or update the session state with all roles
+        for role in roles:
+            if role not in st.session_state.daily_staffing_req:
+                st.session_state.daily_staffing_req[role] = {day: 0 for day in days}
+
+        # Create the input grid
+        for role in roles:
+            st.markdown(f"**{role}**")
+            cols = st.columns(len(days))
+            for i, day in enumerate(days):
+                with cols[i]:
+                    st.session_state.daily_staffing_req[role][day] = st.number_input(
+                        day,
+                        min_value=0,
+                        value=st.session_state.daily_staffing_req[role][day],
+                        key=f"staff_req_{role}_{day}",
+                        label_visibility="collapsed"
+                    )
 
         st.subheader("Advanced Custom Code Constraints")
         st.info("For advanced users: write Python code to add custom constraints directly to the OR-Tools model.")
